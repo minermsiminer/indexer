@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Python-HTML Indexer</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        .thumbnail {
+            position: relative;
+            border-radius: 8px;
+            overflow: hidden;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+            transition: transform 0.2s;
+        }
+        .thumbnail:hover {
+            transform: scale(1.05);
+        }
+        .thumbnail img {
+            width: 100%;
+            height: 200px;
+            object-fit: cover;
+        }
+        .thumbnail-info {
+            padding: 12px;
+            background: white;
+        }
+        .missing-deps-corner {
+            position: absolute;
+            top: 0;
+            right: 0;
+            width: 0;
+            height: 0;
+            border-style: solid;
+            border-width: 0 30px 30px 0;
+            border-color: transparent #ef4444 transparent transparent;
+        }
+        .processing {
+            animation: pulse 2s infinite;
+        }
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.5; }
+            100% { opacity: 1; }
+        }
+    </style>
+</head>
+<body class="bg-gray-100 min-h-screen">
+    <div class="container mx-auto px-4 py-8">
+        <h1 class="text-3xl font-bold mb-6">Python-HTML Indexer</h1>
+
+        <!-- Scan Form -->
+        <div class="bg-white rounded-lg shadow-md p-6 mb-6">
+            <h2 class="text-xl font-semibold mb-4">Scan Folder</h2>
+            <form action="/scan" method="post" enctype="multipart/form-data">
+                <div class="mb-4">
+                    <label class="block text-sm font-medium text-gray-700">Folder Path</label>
+                    <input type="text" name="folder_path" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500" placeholder="/path/to/folder">
+                </div>
+                <button type="submit" class="bg-blue-500 text-white px-4 py-2 rounded-md hover:bg-blue-600">
+                    Scan Folder
+                </button>
+            </form>
+        </div>
+
+        <!-- Processing Status -->
+        {% if is_processing %}
+        <div class="bg-yellow-100 border-l-4 border-yellow-500 text-yellow-700 p-4 mb-6 processing">
+            <p class="font-bold">Processing thumbnails...</p>
+            <p>Completed: {{ processing_completed }} / {{ processing_total }}</p>
+        </div>
+        {% endif %}
+
+        <!-- Thumbnails Grid -->
+        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
+            {% for thumbnail in thumbnails %}
+            <div class="thumbnail">
+                {% if thumbnail.missing_dependencies %}
+                <div class="missing-deps-corner" title="Missing dependencies"></div>
+                {% endif %}
+                <img src="{{ thumbnail.thumb_url }}" alt="{{ thumbnail.name }}">
+                <div class="thumbnail-info">
+                    <h3 class="font-semibold text-lg">{{ thumbnail.name }}</h3>
+                    <p class="text-sm text-gray-600">{{ thumbnail.app_type.replace('_', ' ').title() }}</p>
+                    {% if thumbnail.dependencies %}
+                    <p class="text-xs text-gray-500">Deps: {{ thumbnail.dependencies }}</p>
+                    {% endif %}
+                    {% if thumbnail.description %}
+                    <p class="text-sm text-gray-700 mt-2">{{ thumbnail.description[:100] }}...</p>
+                    {% endif %}
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+
+        {% if not thumbnails %}
+        <div class="text-center py-12">
+            <p class="text-gray-500">No indexed applications found. Scan a folder to get started.</p>
+        </div>
+        {% endif %}
+    </div>
+
+    <script>
+        // Auto-refresh progress
+        {% if is_processing %}
+        setInterval(function() {
+            fetch('/progress')
+                .then(response => response.json())
+                .then(data => {
+                    if (!data.is_processing) {
+                        location.reload();
+                    }
+                });
+        }, 2000);
+        {% endif %}
+    </script>
+</body>
+</html>
