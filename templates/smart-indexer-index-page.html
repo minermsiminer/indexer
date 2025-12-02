@@ -281,13 +281,24 @@
             </div>
         </div>
 
-        <!-- Scan Form -->
+        <!-- Scan Forms -->
         <div class="card rounded-lg p-4 mb-4">
             <h2 class="text-lg font-semibold mb-3">Scan Folder</h2>
             <form action="/scan" method="post" enctype="multipart/form-data" class="flex gap-3">
                 <input type="text" name="folder_path" class="flex-1 px-3 py-1.5 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-white text-sm" placeholder="/path/to/folder" required>
                 <button type="submit" class="px-4 py-1.5 btn-primary rounded-lg font-medium text-sm">Scan Folder</button>
             </form>
+        </div>
+
+        <!-- GitHub Repository Scan -->
+        <div class="card rounded-lg p-4 mb-4">
+            <h2 class="text-lg font-semibold mb-3">Scan GitHub Repository</h2>
+            <form action="/scan-github" method="post" enctype="multipart/form-data" class="flex gap-3">
+                <input type="text" name="github_url" id="github-url" class="flex-1 px-3 py-1.5 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-white text-sm" placeholder="https://github.com/owner/repo or owner/repo" required>
+                <button type="button" id="check-github-btn" class="px-3 py-1.5 bg-blue-500 text-white rounded-lg hover:bg-blue-600 text-sm">Check</button>
+                <button type="submit" class="px-4 py-1.5 btn-primary rounded-lg font-medium text-sm">Clone & Index</button>
+            </form>
+            <div id="github-check-result" class="mt-2 text-sm hidden"></div>
         </div>
 
         <!-- Scanning Status -->

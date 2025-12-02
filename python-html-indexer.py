@@ -5,6 +5,10 @@ import subprocess
 import socket
 import socketserver
 import http.server
+import shutil
+import tempfile
+import urllib.request
+import json
 from pathlib import Path
 from flask import Flask, render_template, request, redirect, url_for, flash, jsonify, send_file
 from selenium import webdriver
@@ -50,6 +54,207 @@ current_python_app = None  # {'process': p, 'html_path': path, 'url': url}
 
 # Global registry for running HTML servers
 running_html_servers = {}  # {html_path: {'server': httpd, 'port': port, 'thread': thread}}
+
+# GitHub repositories directory
+REPOS_FOLDER = Path("repos")
+REPOS_FOLDER.mkdir(exist_ok=True)
+
+# --- GitHub Repository Functions ---
+
+def parse_github_url(url):
+    """
+    Parse a GitHub URL and extract owner and repo name.
+    Supports formats:
+    - https://github.com/owner/repo
+    - https://github.com/owner/repo.git
+    - git@github.com:owner/repo.git
+    - owner/repo (shorthand)
+    Returns tuple (owner, repo) or None if invalid.
+    """
+    url = url.strip()
+    
+    # Handle shorthand format: owner/repo
+    if '/' in url and not url.startswith(('http', 'git@')):
+        parts = url.split('/')
+        if len(parts) == 2:
+            return (parts[0], parts[1].replace('.git', ''))
+    
+    # Handle SSH format: git@github.com:owner/repo.git
+    if url.startswith('git@github.com:'):
+        path = url.replace('git@github.com:', '').replace('.git', '')
+        parts = path.split('/')
+        if len(parts) >= 2:
+            return (parts[0], parts[1])
+    
+    # Handle HTTPS format: https://github.com/owner/repo
+    if 'github.com' in url:
+        # Remove .git extension if present
+        url = url.replace('.git', '')
+        # Extract path after github.com
+        if 'github.com/' in url:
+            path = url.split('github.com/')[1]
+            parts = path.split('/')
+            if len(parts) >= 2:
+                return (parts[0], parts[1])
+    
+    return None
+
+
+def check_github_repo_has_target_files(owner, repo):
+    """
+    Check if a GitHub repository contains Python or HTML files.
+    Uses GitHub API to check the repository tree.
+    Returns dict with 'has_python', 'has_html', and 'error' keys.
+    """
+    result = {'has_python': False, 'has_html': False, 'error': None, 'file_count': {'python': 0, 'html': 0}}
+    
+    try:
+        # Use GitHub API to get repository contents (recursive tree)
+        api_url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/HEAD?recursive=1"
+        
+        req = urllib.request.Request(api_url)
+        req.add_header('Accept', 'application/vnd.github.v3+json')
+        req.add_header('User-Agent', 'Python-HTML-Indexer')
+        
+        # Check for GitHub token in environment for higher rate limits
+        github_token = os.environ.get('GITHUB_TOKEN')
+        if github_token:
+            req.add_header('Authorization', f'token {github_token}')
+        
+        with urllib.request.urlopen(req, timeout=30) as response:
+            data = json.loads(response.read().decode('utf-8'))
+        
+        # Check tree for .py and .html files
+        if 'tree' in data:
+            for item in data['tree']:
+                if item['type'] == 'blob':  # Only files, not directories
+                    path = item['path'].lower()
+                    # Skip common non-relevant directories
+                    if any(skip in path for skip in ['.venv/', 'venv/', 'node_modules/', 'site-packages/', '__pycache__/']):
+                        continue
+                    
+                    if path.endswith('.py'):
+                        result['has_python'] = True
+                        result['file_count']['python'] += 1
+                    elif path.endswith('.html'):
+                        result['has_html'] = True
+                        result['file_count']['html'] += 1
+        
+        return result
+        
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            result['error'] = f"Repository '{owner}/{repo}' not found or is private"
+        elif e.code == 403:
+            result['error'] = "GitHub API rate limit exceeded. Try setting GITHUB_TOKEN environment variable."
+        else:
+            result['error'] = f"GitHub API error: {e.code} - {e.reason}"
+        return result
+    except urllib.error.URLError as e:
+        result['error'] = f"Network error: {str(e)}"
+        return result
+    except Exception as e:
+        result['error'] = f"Error checking repository: {str(e)}"
+        return result
+
+
+def clone_github_repo(owner, repo, target_dir=None):
+    """
+    Clone a GitHub repository to the repos folder.
+    Returns dict with 'success', 'path', and 'error' keys.
+    """
+    result = {'success': False, 'path': None, 'error': None}
+    
+    if target_dir is None:
+        target_dir = REPOS_FOLDER / f"{owner}_{repo}"
+    else:
+        target_dir = Path(target_dir)
+    
+    # Check if repo already exists
+    if target_dir.exists():
+        # Try to update existing repo
+        try:
+            print(f"Repository already exists at {target_dir}, pulling latest changes...")
+            subprocess.run(
+                ['git', 'pull'],
+                cwd=str(target_dir),
+                check=True,
+                capture_output=True,
+                timeout=120
+            )
+            result['success'] = True
+            result['path'] = str(target_dir)
+            result['message'] = 'Repository updated with latest changes'
+            return result
+        except subprocess.CalledProcessError as e:
+            print(f"Failed to pull, will re-clone: {e}")
+            # Remove existing directory and clone fresh
+            shutil.rmtree(target_dir)
+        except subprocess.TimeoutExpired:
+            result['error'] = "Git pull timed out"
+            return result
+    
+    # Clone the repository
+    clone_url = f"https://github.com/{owner}/{repo}.git"
+    
+    try:
+        print(f"Cloning repository: {clone_url}")
+        subprocess.run(
+            ['git', 'clone', '--depth', '1', clone_url, str(target_dir)],
+            check=True,
+            capture_output=True,
+            timeout=300  # 5 minute timeout for large repos
+        )
+        result['success'] = True
+        result['path'] = str(target_dir)
+        result['message'] = 'Repository cloned successfully'
+        return result
+        
+    except subprocess.CalledProcessError as e:
+        stderr = e.stderr.decode('utf-8') if e.stderr else ''
+        if 'Repository not found' in stderr:
+            result['error'] = f"Repository '{owner}/{repo}' not found or is private"
+        else:
+            result['error'] = f"Git clone failed: {stderr}"
+        return result
+    except subprocess.TimeoutExpired:
+        result['error'] = "Git clone timed out (repository may be too large)"
+        # Clean up partial clone
+        if target_dir.exists():
+            shutil.rmtree(target_dir)
+        return result
+    except FileNotFoundError:
+        result['error'] = "Git is not installed or not in PATH"
+        return result
+    except Exception as e:
+        result['error'] = f"Error cloning repository: {str(e)}"
+        return result
+
+
+def get_cloned_repos():
+    """Get list of already cloned repositories."""
+    repos = []
+    if REPOS_FOLDER.exists():
+        for repo_dir in REPOS_FOLDER.iterdir():
+            if repo_dir.is_dir() and (repo_dir / '.git').exists():
+                repos.append({
+                    'name': repo_dir.name,
+                    'path': str(repo_dir),
+                    'indexed': db_has_items_from_path(str(repo_dir))
+                })
+    return repos
+
+
+def db_has_items_from_path(folder_path):
+    """Check if database has any indexed items from a folder path."""
+    try:
+        with db.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT COUNT(*) FROM indexed_items WHERE folder_path LIKE ?', (f'{folder_path}%',))
+            count = cursor.fetchone()[0]
+            return count > 0
+    except:
+        return False
 
 def _get_file_size(file_path):
     """Get file size in bytes."""
@@ -1995,6 +2200,257 @@ def scan_folder():
 
     flash(f"Started scanning folder '{target_folder.name}'. Progress will be shown in real-time.", "success")
     return redirect(url_for('index'))
+
+
+@app.route('/api/github/check', methods=['POST'])
+def check_github_repo():
+    """Check if a GitHub repository has Python or HTML files."""
+    try:
+        data = request.get_json()
+        github_url = data.get('url', '').strip()
+        
+        if not github_url:
+            return jsonify({'success': False, 'error': 'GitHub URL is required'}), 400
+        
+        # Parse the GitHub URL
+        parsed = parse_github_url(github_url)
+        if not parsed:
+            return jsonify({
+                'success': False,
+                'error': 'Invalid GitHub URL. Supported formats: https://github.com/owner/repo, owner/repo'
+            }), 400
+        
+        owner, repo = parsed
+        
+        # Check if repo has target files
+        check_result = check_github_repo_has_target_files(owner, repo)
+        
+        if check_result['error']:
+            return jsonify({'success': False, 'error': check_result['error']}), 400
+        
+        has_target_files = check_result['has_python'] or check_result['has_html']
+        
+        return jsonify({
+            'success': True,
+            'owner': owner,
+            'repo': repo,
+            'has_python': check_result['has_python'],
+            'has_html': check_result['has_html'],
+            'python_count': check_result['file_count']['python'],
+            'html_count': check_result['file_count']['html'],
+            'has_target_files': has_target_files,
+            'message': f"Found {check_result['file_count']['python']} Python and {check_result['file_count']['html']} HTML files" if has_target_files else "No Python or HTML files found in this repository"
+        })
+        
+    except Exception as e:
+        print(f"Error checking GitHub repo: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/github/clone', methods=['POST'])
+def clone_github_repo_route():
+    """Clone a GitHub repository and index it."""
+    global scanning_files, scanning_results, scanning_completed, scanning_total, scanning_current_phase
+    
+    try:
+        data = request.get_json()
+        github_url = data.get('url', '').strip()
+        skip_check = data.get('skip_check', False)
+        
+        if not github_url:
+            return jsonify({'success': False, 'error': 'GitHub URL is required'}), 400
+        
+        # Parse the GitHub URL
+        parsed = parse_github_url(github_url)
+        if not parsed:
+            return jsonify({
+                'success': False,
+                'error': 'Invalid GitHub URL. Supported formats: https://github.com/owner/repo, owner/repo'
+            }), 400
+        
+        owner, repo = parsed
+        
+        # Optionally check for target files first
+        if not skip_check:
+            check_result = check_github_repo_has_target_files(owner, repo)
+            
+            if check_result['error']:
+                return jsonify({'success': False, 'error': check_result['error']}), 400
+            
+            if not check_result['has_python'] and not check_result['has_html']:
+                return jsonify({
+                    'success': False,
+                    'error': 'Repository does not contain any Python or HTML files. Use skip_check=true to clone anyway.'
+                }), 400
+        
+        # Clone the repository
+        clone_result = clone_github_repo(owner, repo)
+        
+        if not clone_result['success']:
+            return jsonify({'success': False, 'error': clone_result['error']}), 400
+        
+        target_folder = Path(clone_result['path'])
+        
+        # Start indexing the cloned repository
+        print(f"[GITHUB_SCAN] Starting scan of cloned repository: {target_folder}")
+        
+        # Reset scanning state
+        scanning_files = [{'scan_start_time': time.time()}]
+        scanning_results = {}
+        scanning_completed = 0
+        scanning_total = 1
+        scanning_current_phase = "initializing"
+        
+        # Start background scanning worker thread
+        scanning_worker_thread = threading.Thread(target=scanning_worker)
+        scanning_worker_thread.daemon = True
+        scanning_worker_thread.start()
+        
+        # Add scanning tasks to queue
+        scanning_tasks = [
+            {'type': 'find_python_apps', 'target_folder': target_folder},
+            {'type': 'find_html_files', 'target_folder': target_folder},
+            {'type': 'save_to_database', 'target_folder': target_folder}
+        ]
+        
+        for task in scanning_tasks:
+            scanning_queue.put(task)
+        
+        return jsonify({
+            'success': True,
+            'message': f"Successfully cloned {owner}/{repo}. Indexing started.",
+            'path': str(target_folder),
+            'clone_message': clone_result.get('message', 'Repository cloned')
+        })
+        
+    except Exception as e:
+        print(f"Error cloning GitHub repo: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/github/repos', methods=['GET'])
+def list_cloned_repos():
+    """List all cloned GitHub repositories."""
+    try:
+        repos = get_cloned_repos()
+        return jsonify({
+            'success': True,
+            'repos': repos
+        })
+    except Exception as e:
+        print(f"Error listing cloned repos: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/github/delete', methods=['POST'])
+def delete_cloned_repo():
+    """Delete a cloned repository."""
+    try:
+        data = request.get_json()
+        repo_path = data.get('path', '').strip()
+        
+        if not repo_path:
+            return jsonify({'success': False, 'error': 'Repository path is required'}), 400
+        
+        repo_path = Path(repo_path)
+        
+        # Security check: ensure the path is within the repos folder
+        if not str(repo_path.resolve()).startswith(str(REPOS_FOLDER.resolve())):
+            return jsonify({'success': False, 'error': 'Invalid repository path'}), 400
+        
+        if not repo_path.exists():
+            return jsonify({'success': False, 'error': 'Repository not found'}), 404
+        
+        # Remove indexed items from database
+        removed_count = db.remove_folder_items(str(repo_path))
+        
+        # Delete the repository folder
+        shutil.rmtree(repo_path)
+        
+        return jsonify({
+            'success': True,
+            'message': f'Repository deleted. Removed {removed_count} indexed items.'
+        })
+        
+    except Exception as e:
+        print(f"Error deleting cloned repo: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/scan-github', methods=['POST'])
+def scan_github():
+    """Handle GitHub repository scan from form submission."""
+    global scanning_files, scanning_results, scanning_completed, scanning_total, scanning_current_phase
+    
+    github_url = request.form.get('github_url', '').strip()
+    
+    if not github_url:
+        flash("Please provide a GitHub repository URL.", "error")
+        return redirect(url_for('index'))
+    
+    # Parse the GitHub URL
+    parsed = parse_github_url(github_url)
+    if not parsed:
+        flash("Invalid GitHub URL. Supported formats: https://github.com/owner/repo, owner/repo", "error")
+        return redirect(url_for('index'))
+    
+    owner, repo = parsed
+    
+    # Check if repo has target files
+    print(f"[GITHUB_SCAN] Checking repository {owner}/{repo} for Python/HTML files...")
+    check_result = check_github_repo_has_target_files(owner, repo)
+    
+    if check_result['error']:
+        flash(f"Error checking repository: {check_result['error']}", "error")
+        return redirect(url_for('index'))
+    
+    if not check_result['has_python'] and not check_result['has_html']:
+        flash(f"Repository '{owner}/{repo}' does not contain any Python or HTML files.", "warning")
+        return redirect(url_for('index'))
+    
+    # Clone the repository
+    print(f"[GITHUB_SCAN] Cloning repository {owner}/{repo}...")
+    clone_result = clone_github_repo(owner, repo)
+    
+    if not clone_result['success']:
+        flash(f"Error cloning repository: {clone_result['error']}", "error")
+        return redirect(url_for('index'))
+    
+    target_folder = Path(clone_result['path'])
+    
+    # Start indexing the cloned repository
+    print(f"[GITHUB_SCAN] Starting scan of cloned repository: {target_folder}")
+    
+    # Reset scanning state
+    scanning_files = [{'scan_start_time': time.time()}]
+    scanning_results = {}
+    scanning_completed = 0
+    scanning_total = 1
+    scanning_current_phase = "initializing"
+    
+    # Start background scanning worker thread
+    scanning_worker_thread = threading.Thread(target=scanning_worker)
+    scanning_worker_thread.daemon = True
+    scanning_worker_thread.start()
+    
+    # Add scanning tasks to queue
+    scanning_tasks = [
+        {'type': 'find_python_apps', 'target_folder': target_folder},
+        {'type': 'find_html_files', 'target_folder': target_folder},
+        {'type': 'save_to_database', 'target_folder': target_folder}
+    ]
+    
+    for task in scanning_tasks:
+        scanning_queue.put(task)
+    
+    file_info = f"({check_result['file_count']['python']} Python, {check_result['file_count']['html']} HTML files)"
+    flash(f"Successfully cloned '{owner}/{repo}' {file_info}. Indexing started.", "success")
+    return redirect(url_for('index'))
+
 
 # Global variable for launcher process
 launcher_process = None
